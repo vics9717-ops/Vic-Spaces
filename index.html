@@ -60,6 +60,9 @@
   .modal-input{width:100%;border:1.5px solid var(--border);border-radius:14px;padding:13px 15px;font-size:16px;font-family:'DM Sans',sans-serif;outline:none;transition:border-color .2s;background:white;}
   .modal-input:focus{border-color:var(--text);}
   .modal-label{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;display:block;}
+  .amount-preview{font-family:'Fraunces',serif;font-size:28px;font-weight:600;color:var(--text);text-align:center;padding:8px 0 4px;min-height:44px;transition:all .15s;letter-spacing:-.5px;}
+  .amount-preview.has-value{color:var(--text);}
+  .amount-preview.empty{color:var(--border);}
   .modal-btn{width:100%;background:var(--text);color:white;border:none;border-radius:16px;padding:15px;font-size:16px;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer;margin-top:18px;}
   .modal-btn-secondary{width:100%;background:var(--bg);color:var(--text);border:none;border-radius:16px;padding:13px;font-size:15px;font-weight:500;font-family:'DM Sans',sans-serif;cursor:pointer;margin-top:8px;}
 
@@ -372,15 +375,64 @@ const getSyncUrl=()=>localStorage.getItem('vs_sheets_url')||'';
 const saveSyncUrl=u=>localStorage.setItem('vs_sheets_url',u);
 
 // ══════════════════════════════════════════════════════
+//  PULL FROM SHEETS — sync bidireccional al abrir
+// ══════════════════════════════════════════════════════
+async function pullFromSheets(){
+  const url=getSyncUrl(); if(!url) return;
+  showLoadingOverlay(true);
+  try{
+    const res=await fetch(url+'?action=pull&year='+YEAR,{method:'GET',redirect:'follow'});
+    const text=await res.text();
+    // Apps Script may wrap in callback or redirect — try to extract JSON
+    const jsonMatch=text.match(/\{[\s\S]*\}/);
+    if(!jsonMatch) throw new Error('no json');
+    const json=JSON.parse(jsonMatch[0]);
+    if(json.ok && json.data){
+      Object.entries(json.data).forEach(([mIdx,mData])=>{
+        if(mData&&(mData.movements?.length||Object.keys(mData.checklist||{}).length)){
+          // Merge: Sheet data wins for movements, keep local checklist if sheet has none
+          const local=getData(parseInt(mIdx));
+          const merged={
+            movements: mData.movements||[],
+            cuotas: mData.cuotas||local.cuotas||[],
+            checklist: Object.keys(mData.checklist||{}).length ? mData.checklist : local.checklist,
+          };
+          saveData(parseInt(mIdx),merged);
+        }
+      });
+      if(json.settings) saveSettings({...getSettings(),...json.settings});
+      showToast('✅ Sincronizado con Google Sheets');
+    }
+  }catch(e){
+    console.log('Pull failed, using local data:', e.message);
+  }
+  showLoadingOverlay(false);
+}
+
+function showLoadingOverlay(show){
+  let el=document.getElementById('vsLoading');
+  if(!el){
+    el=document.createElement('div');
+    el.id='vsLoading';
+    el.style.cssText='position:fixed;inset:0;background:rgba(248,247,244,.95);z-index:300;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;font-family:"DM Sans",sans-serif;transition:opacity .3s;';
+    el.innerHTML='<div style="font-size:32px;">💸</div><div style="font-size:14px;font-weight:600;color:#1a1a1a;">Cargando datos...</div><div style="font-size:12px;color:#6b7280;">Sincronizando con Google Sheets</div>';
+    document.body.appendChild(el);
+  }
+  if(show){ el.style.display='flex'; el.style.opacity='1'; }
+  else { el.style.opacity='0'; setTimeout(()=>el.style.display='none',300); }
+}
+
+// ══════════════════════════════════════════════════════
 //  FORMAT — punto para miles, sin decimales
 // ══════════════════════════════════════════════════════
 function fmt(n){
-  // Uses period as thousands separator (Argentine style but with dot instead of comma for readability)
-  const abs=Math.abs(n||0);
-  const str=Math.round(abs).toString();
-  // Insert dots every 3 digits from the right
-  const withDots=str.replace(/\B(?=(\d{3})+(?!\d))/g,'.');
-  return '$'+withDots;
+  const abs=Math.round(Math.abs(n||0));
+  // Always use dot as thousands separator
+  return '$'+abs.toString().replace(/\B(?=(\d{3})+(?!\d))/g,'.');
+}
+// Format input value for display inside modal (plain number, no symbols)
+function fmtInput(n){
+  return Math.round(Math.abs(n||0)).toString();
 }
 
 // ══════════════════════════════════════════════════════
@@ -446,27 +498,60 @@ function propagateCuotas(monthIdx) {
 }
 
 // ══════════════════════════════════════════════════════
-//  SYNC
+//  SYNC — uses fetch with proper CORS handling for Apps Script
+//  Apps Script Web Apps require the URL to have ?action=sync
+//  and accept application/x-www-form-urlencoded or plain text POST
 // ══════════════════════════════════════════════════════
 let syncTimeout=null;
+
 async function syncToSheets(monthIdx){
   const url=getSyncUrl(); if(!url) return;
   setSyncStatus('syncing');
   const data=getData(monthIdx);
+  const payload={action:'sync',monthIdx,year:YEAR,movements:data.movements||[],cuotas:data.cuotas||[]};
+
   try{
-    await fetch(url,{method:'POST',mode:'no-cors',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:'sync',monthIdx,year:YEAR,movements:data.movements||[],cuotas:data.cuotas||[]})});
-    setSyncStatus('ok');
-  }catch(e){setSyncStatus('err');}
+    // Apps Script handles POST with text/plain body — avoids preflight CORS issue
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+      redirect: 'follow',
+    });
+    if(res.ok || res.type==='opaqueredirect' || res.status===0){
+      setSyncStatus('ok');
+    } else {
+      // Try GET as fallback with data in query param (for small payloads)
+      const encoded=encodeURIComponent(JSON.stringify(payload));
+      const r2=await fetch(url+'?data='+encoded, {method:'GET', redirect:'follow'});
+      setSyncStatus(r2.ok||r2.type==='opaqueredirect'?'ok':'err');
+    }
+  } catch(e){
+    // If fetch fails entirely (network, CORS block), try image beacon as last resort
+    try{
+      const encoded=encodeURIComponent(JSON.stringify({action:'sync',monthIdx,year:YEAR}));
+      new Image().src=url+'?ping=1&m='+monthIdx+'&d='+encoded;
+      setSyncStatus('warn');
+      showToast('⚠️ Sync parcial — revisá el Sheet');
+    } catch(e2){ setSyncStatus('err'); }
+  }
 }
-function schedulSync(m){const url=getSyncUrl();if(!url)return;clearTimeout(syncTimeout);syncTimeout=setTimeout(()=>syncToSheets(m),1500);setSyncStatus('syncing');}
+
+function schedulSync(m){
+  const url=getSyncUrl(); if(!url) return;
+  clearTimeout(syncTimeout);
+  syncTimeout=setTimeout(()=>syncToSheets(m), 1800);
+  setSyncStatus('syncing');
+}
+
 function setSyncStatus(s){
-  const p=document.getElementById('syncPill'),l=document.getElementById('syncLabel');if(!p)return;
+  const p=document.getElementById('syncPill'),l=document.getElementById('syncLabel'); if(!p)return;
   p.className='sync-pill';
-  if(s==='ok'){p.classList.add('sync-ok');l.textContent='Sincronizado';}
-  else if(s==='syncing'){p.classList.add('sync-warn');l.textContent='Sincronizando...';}
-  else if(s==='err'){p.classList.add('sync-err');l.textContent='Error';}
-  else{p.classList.add('sync-warn');l.textContent='Sheets';}
+  if(s==='ok')     { p.classList.add('sync-ok');   l.textContent='Sincronizado'; }
+  else if(s==='syncing') { p.classList.add('sync-warn'); l.textContent='Sincronizando...'; }
+  else if(s==='warn')    { p.classList.add('sync-warn'); l.textContent='Sync parcial'; }
+  else if(s==='err')     { p.classList.add('sync-err');  l.textContent='Error sync'; }
+  else                   { p.classList.add('sync-warn'); l.textContent='Sheets'; }
 }
 function openSyncSettings(){
   const url=getSyncUrl();
@@ -972,9 +1057,20 @@ document.addEventListener('keydown',e=>{
   }
 });
 
-// Init — propagate cuotas on load for current month
-propagateCuotas(curMonth);
-renderAll();
+// ── INIT ──
+// Always open on current real month (fix cache issue)
+curMonth = new Date().getMonth();
+
+// If Sheets is configured, pull fresh data first, then render
+// Otherwise render immediately with local data
+async function init(){
+  if(getSyncUrl()){
+    await pullFromSheets();
+  }
+  propagateCuotas(curMonth);
+  renderAll();
+}
+init();
 </script>
 </body>
 </html>
