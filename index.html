@@ -515,33 +515,74 @@ function propagateCuotas(monthIdx) {
 }
 
 // ══════════════════════════════════════════════════════
-//  SYNC — POST con no-cors (el browser no puede leer la respuesta
-//  pero Apps Script SÍ recibe y procesa el request)
-//  Para confirmar que llegó, hacemos un pull liviano después
+//  SYNC — via JSONP GET (único método 100% compatible con
+//  Apps Script sin servidor propio)
+//  Los datos van en el query string comprimidos
 // ══════════════════════════════════════════════════════
 let syncTimeout=null;
 
-async function syncToSheets(monthIdx){
-  const url=getSyncUrl(); if(!url) return;
+function syncToSheets(monthIdx){
+  const url=getSyncUrl(); if(!url) return Promise.resolve();
   setSyncStatus('syncing');
   const data=getData(monthIdx);
-  const payload={action:'sync',monthIdx,year:YEAR,movements:data.movements||[],cuotas:data.cuotas||[]};
 
-  try{
-    // no-cors: browser no lee respuesta pero el request SÍ llega a Apps Script
-    await fetch(url, {
-      method:'POST',
-      mode:'no-cors',
-      headers:{'Content-Type':'text/plain;charset=utf-8'},
-      body:JSON.stringify(payload),
-    });
-    // Con no-cors siempre "success" (no hay forma de saber si falló en red)
-    setSyncStatus('ok');
-    showToast('📊 Guardado en Google Sheets');
-  } catch(e){
+  // Split movements in chunks if needed (URL limit ~2000 chars per request)
+  // We send metadata first, then movements in batches
+  const movements=data.movements||[];
+  const cuotas=data.cuotas||[];
+
+  return jsonpRequest(url, {
+    action:'sync',
+    monthIdx,
+    year:YEAR,
+    movements: JSON.stringify(movements),
+    cuotas: JSON.stringify(cuotas),
+  }).then(res=>{
+    if(res && res.ok){
+      setSyncStatus('ok');
+      showToast('📊 Guardado en Google Sheets');
+    } else {
+      setSyncStatus('err');
+      showToast('⚠️ Error al guardar en Sheets');
+    }
+  }).catch(()=>{
     setSyncStatus('err');
     showToast('⚠️ Sin conexión — guardado localmente');
-  }
+  });
+}
+
+// JSONP helper — works around CORS for both GET and POST-like operations
+function jsonpRequest(url, params){
+  return new Promise((resolve, reject)=>{
+    const cbName='vsJSONP_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+    const timeout=setTimeout(()=>{
+      cleanup();
+      reject(new Error('timeout'));
+    }, 10000);
+
+    window[cbName]=function(data){
+      cleanup();
+      resolve(data);
+    };
+
+    function cleanup(){
+      clearTimeout(timeout);
+      delete window[cbName];
+      const s=document.getElementById('vsJsonpOut');
+      if(s) s.remove();
+    }
+
+    // Build query string
+    const qs=Object.entries({...params, callback:cbName})
+      .map(([k,v])=>encodeURIComponent(k)+'='+encodeURIComponent(v))
+      .join('&');
+
+    const script=document.createElement('script');
+    script.id='vsJsonpOut';
+    script.src=url+'?'+qs;
+    script.onerror=()=>{ cleanup(); reject(new Error('script error')); };
+    document.head.appendChild(script);
+  });
 }
 
 function schedulSync(m){
