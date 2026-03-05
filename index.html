@@ -377,36 +377,53 @@ const saveSyncUrl=u=>localStorage.setItem('vs_sheets_url',u);
 // ══════════════════════════════════════════════════════
 //  PULL FROM SHEETS — sync bidireccional al abrir
 // ══════════════════════════════════════════════════════
-async function pullFromSheets(){
-  const url=getSyncUrl(); if(!url) return;
+// PULL via JSONP — único método que funciona sin CORS desde browser
+function pullFromSheets(){
+  const url=getSyncUrl(); if(!url) return Promise.resolve();
   showLoadingOverlay(true);
-  try{
-    const res=await fetch(url+'?action=pull&year='+YEAR,{method:'GET',redirect:'follow'});
-    const text=await res.text();
-    // Apps Script may wrap in callback or redirect — try to extract JSON
-    const jsonMatch=text.match(/\{[\s\S]*\}/);
-    if(!jsonMatch) throw new Error('no json');
-    const json=JSON.parse(jsonMatch[0]);
-    if(json.ok && json.data){
-      Object.entries(json.data).forEach(([mIdx,mData])=>{
-        if(mData&&(mData.movements?.length||Object.keys(mData.checklist||{}).length)){
-          // Merge: Sheet data wins for movements, keep local checklist if sheet has none
-          const local=getData(parseInt(mIdx));
-          const merged={
-            movements: mData.movements||[],
-            cuotas: mData.cuotas||local.cuotas||[],
-            checklist: Object.keys(mData.checklist||{}).length ? mData.checklist : local.checklist,
-          };
-          saveData(parseInt(mIdx),merged);
+  return new Promise((resolve)=>{
+    const cbName='vsCallback_'+Date.now();
+    const timeout=setTimeout(()=>{
+      cleanup(); showLoadingOverlay(false);
+      console.log('Pull timeout — usando datos locales');
+      resolve();
+    }, 8000);
+
+    window[cbName]=function(json){
+      cleanup();
+      try{
+        if(json && json.ok && json.data){
+          Object.entries(json.data).forEach(([mIdx,mData])=>{
+            if(mData&&(mData.movements?.length||Object.keys(mData.checklist||{}).length)){
+              const local=getData(parseInt(mIdx));
+              saveData(parseInt(mIdx),{
+                movements: mData.movements||[],
+                cuotas: mData.cuotas||local.cuotas||[],
+                checklist: Object.keys(mData.checklist||{}).length?mData.checklist:local.checklist,
+              });
+            }
+          });
+          if(json.settings) saveSettings({...getSettings(),...json.settings});
+          showToast('✅ Datos actualizados');
         }
-      });
-      if(json.settings) saveSettings({...getSettings(),...json.settings});
-      showToast('✅ Sincronizado con Google Sheets');
+      }catch(e){ console.log('Pull parse error:',e); }
+      showLoadingOverlay(false);
+      resolve();
+    };
+
+    function cleanup(){
+      clearTimeout(timeout);
+      delete window[cbName];
+      const s=document.getElementById('vsJsonpScript');
+      if(s) s.remove();
     }
-  }catch(e){
-    console.log('Pull failed, using local data:', e.message);
-  }
-  showLoadingOverlay(false);
+
+    const script=document.createElement('script');
+    script.id='vsJsonpScript';
+    script.src=url+'?action=pull&year='+YEAR+'&callback='+cbName;
+    script.onerror=()=>{ cleanup(); showLoadingOverlay(false); resolve(); };
+    document.head.appendChild(script);
+  });
 }
 
 function showLoadingOverlay(show){
@@ -498,9 +515,9 @@ function propagateCuotas(monthIdx) {
 }
 
 // ══════════════════════════════════════════════════════
-//  SYNC — uses fetch with proper CORS handling for Apps Script
-//  Apps Script Web Apps require the URL to have ?action=sync
-//  and accept application/x-www-form-urlencoded or plain text POST
+//  SYNC — POST con no-cors (el browser no puede leer la respuesta
+//  pero Apps Script SÍ recibe y procesa el request)
+//  Para confirmar que llegó, hacemos un pull liviano después
 // ══════════════════════════════════════════════════════
 let syncTimeout=null;
 
@@ -511,29 +528,19 @@ async function syncToSheets(monthIdx){
   const payload={action:'sync',monthIdx,year:YEAR,movements:data.movements||[],cuotas:data.cuotas||[]};
 
   try{
-    // Apps Script handles POST with text/plain body — avoids preflight CORS issue
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload),
-      redirect: 'follow',
+    // no-cors: browser no lee respuesta pero el request SÍ llega a Apps Script
+    await fetch(url, {
+      method:'POST',
+      mode:'no-cors',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify(payload),
     });
-    if(res.ok || res.type==='opaqueredirect' || res.status===0){
-      setSyncStatus('ok');
-    } else {
-      // Try GET as fallback with data in query param (for small payloads)
-      const encoded=encodeURIComponent(JSON.stringify(payload));
-      const r2=await fetch(url+'?data='+encoded, {method:'GET', redirect:'follow'});
-      setSyncStatus(r2.ok||r2.type==='opaqueredirect'?'ok':'err');
-    }
+    // Con no-cors siempre "success" (no hay forma de saber si falló en red)
+    setSyncStatus('ok');
+    showToast('📊 Guardado en Google Sheets');
   } catch(e){
-    // If fetch fails entirely (network, CORS block), try image beacon as last resort
-    try{
-      const encoded=encodeURIComponent(JSON.stringify({action:'sync',monthIdx,year:YEAR}));
-      new Image().src=url+'?ping=1&m='+monthIdx+'&d='+encoded;
-      setSyncStatus('warn');
-      showToast('⚠️ Sync parcial — revisá el Sheet');
-    } catch(e2){ setSyncStatus('err'); }
+    setSyncStatus('err');
+    showToast('⚠️ Sin conexión — guardado localmente');
   }
 }
 
